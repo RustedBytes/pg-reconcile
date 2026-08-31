@@ -25,3 +25,7 @@ and administration roles.
 Append-only triggers are defense in depth and apply even to a role with table
 write privileges. The extension never exposes a path that changes
 `ledger_accounts`, `ledger_entries`, or `ledger_transactions`.
+
+Manual-decision entry points derive `actor` from `session_user`. Supplying a
+different actor is rejected, including through a `SECURITY DEFINER` call, so an
+operator cannot impersonate another database principal in the audit trail.

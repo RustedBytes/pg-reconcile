@@ -30,7 +30,9 @@ provider transaction and `reverses_external_transaction_id` for a reversal.
 Both functions accept `idempotency_key`. The same key and same canonical
 payload returns the existing UUID. Reusing it with different data raises
 SQLSTATE `PGR04`. Concurrent retries serialize on a transaction-scoped advisory
-lock and the unique indexes remain the final constraint.
+lock and the unique indexes remain the final constraint. `received_at` records
+the first persisted receipt and is not part of the financial-payload hash, so a
+retry that uses its default `clock_timestamp()` remains idempotent.
 
 When optional money or cryptocurrency adapters are enabled, both ingestion
 functions accept `money_with_currency`, `money_minor`, or `crypto_amount`
@@ -58,9 +60,11 @@ views documented in the schema: `reconcile_latest_balances`,
 ## Manual decisions
 
 `reconcile_match_manual(external_transaction, ledger_transaction, reason,
-actor)` validates account, asset, and signed amount, then appends a manual
-decision. `reconcile_mark_external_unmatched(...)` appends an explicit unmatched
-decision. Later runs apply the newest decision without changing older results.
+actor)` validates account, asset, signed amount, and one-to-one ledger-entry
+ownership, then appends a manual decision. `actor` defaults to the authenticated
+database `session_user`; passing any different value is rejected. The same rule
+applies to `reconcile_mark_external_unmatched(...)`. Later runs apply the newest
+decision without changing older results.
 
 ## Validation and adapters
 
@@ -78,7 +82,11 @@ Adapter entry points are `reconcile_enable_pg_ledger()`,
 | `PGR04` | `RECONCILE_IDEMPOTENCY_CONFLICT` |
 | `PGR08` | `RECONCILE_INVALID_MANUAL_MATCH` |
 | `PGR09` | `RECONCILE_LEDGER_ADAPTER_MISSING` |
+| `22023` | `RECONCILE_MALFORMED_EXTERNAL` or `RECONCILE_INVALID_RUN` |
+| `55000` | `RECONCILE_IMMUTABLE_EVIDENCE`, `RECONCILE_IMMUTABLE_ACCOUNT_IDENTITY`, or `RECONCILE_IMMUTABLE_RUN` |
+| `XX000` | `RECONCILE_INTERNAL_ERROR` |
 
 Standard SQLSTATE `22023` is used for malformed parameters and `55000` for
-attempted mutation of immutable evidence. The stable detail identifier remains
-machine-readable through PostgreSQL client diagnostics.
+attempted mutation of immutable evidence. `PG_EXCEPTION_DETAIL` contains only
+the stable identifier shown above (or the corresponding documented identifier
+for standard-state failures), so clients do not parse human-readable messages.

@@ -49,6 +49,14 @@ CREATE INDEX reconcile_matches_run_ledger_entry_idx
     ON reconcile_matches (run_id, ledger_entry_id, status)
     WHERE ledger_entry_id IS NOT NULL;
 
+CREATE UNIQUE INDEX reconcile_matches_one_exact_external_idx
+    ON reconcile_matches (run_id, external_transaction_id)
+    WHERE external_transaction_id IS NOT NULL AND status IN ('EXACT', 'PROBABLE');
+
+CREATE UNIQUE INDEX reconcile_matches_one_exact_ledger_entry_idx
+    ON reconcile_matches (run_id, ledger_entry_id)
+    WHERE ledger_entry_id IS NOT NULL AND status IN ('EXACT', 'PROBABLE');
+
 CREATE INDEX reconcile_matches_unresolved_idx
     ON reconcile_matches (run_id, status)
     WHERE status IN ('AMBIGUOUS', 'UNMATCHED_EXTERNAL', 'UNMATCHED_LEDGER', 'CONFLICT');

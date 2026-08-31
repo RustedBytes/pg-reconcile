@@ -30,30 +30,87 @@ SELECT m.*, e.reconcile_account_id, e.external_transaction_id AS provider_transa
        e.amount_units, e.asset_identity, e.direction, e.event_at, e.external_reference
 FROM reconcile_matches m
 JOIN reconcile_external_transactions e ON e.id = m.external_transaction_id
-WHERE m.status = 'UNMATCHED_EXTERNAL';
+WHERE m.status = 'UNMATCHED_EXTERNAL'
+  AND m.run_id = (
+      SELECT latest.id FROM reconcile_runs latest
+      WHERE latest.reconcile_account_id = e.reconcile_account_id
+        AND latest.reconciliation_type IN ('TRANSACTIONS', 'FULL')
+        AND latest.status = 'COMPLETED'
+      ORDER BY latest.completed_at DESC, latest.id DESC LIMIT 1
+  );
 
 CREATE VIEW reconcile_unmatched_ledger AS
 SELECT m.*
 FROM reconcile_matches m
-WHERE m.status = 'UNMATCHED_LEDGER';
+JOIN reconcile_runs r ON r.id = m.run_id
+WHERE m.status = 'UNMATCHED_LEDGER'
+  AND m.run_id = (
+      SELECT latest.id FROM reconcile_runs latest
+      WHERE latest.reconcile_account_id = r.reconcile_account_id
+        AND latest.reconciliation_type IN ('TRANSACTIONS', 'FULL')
+        AND latest.status = 'COMPLETED'
+      ORDER BY latest.completed_at DESC, latest.id DESC LIMIT 1
+  );
 
 CREATE VIEW reconcile_ambiguous AS
 SELECT m.*, e.reconcile_account_id, e.external_transaction_id AS provider_transaction_id,
        e.amount_units, e.asset_identity, e.direction, e.event_at, e.external_reference
 FROM reconcile_matches m
 JOIN reconcile_external_transactions e ON e.id = m.external_transaction_id
-WHERE m.status = 'AMBIGUOUS';
+WHERE m.status = 'AMBIGUOUS'
+  AND m.run_id = (
+      SELECT latest.id FROM reconcile_runs latest
+      WHERE latest.reconcile_account_id = e.reconcile_account_id
+        AND latest.reconciliation_type IN ('TRANSACTIONS', 'FULL')
+        AND latest.status = 'COMPLETED'
+      ORDER BY latest.completed_at DESC, latest.id DESC LIMIT 1
+  );
 
 CREATE VIEW reconcile_issues AS
-SELECT a.name AS account, 'BALANCE_MISMATCH'::text AS issue_type,
+SELECT a.name AS account,
+       CASE b.status
+         WHEN 'MISMATCH' THEN 'BALANCE_MISMATCH'
+         WHEN 'MISSING_EXTERNAL_OBSERVATION' THEN 'STALE_EXTERNAL_BALANCE'
+       END::text AS issue_type,
        a.asset_identity AS asset, abs(b.difference_units) AS amount,
-       o.external_reference, clock_timestamp() - o.observed_at AS age,
+       o.external_reference, clock_timestamp() - coalesce(o.observed_at, r.as_of) AS age,
        'ERROR'::text AS severity, r.id AS run_id
 FROM reconcile_balance_results b
 JOIN reconcile_runs r ON r.id = b.run_id
 JOIN reconcile_accounts a ON a.id = r.reconcile_account_id
 LEFT JOIN reconcile_balance_observations o ON o.id = b.external_observation_id
-WHERE b.status = 'MISMATCH'
+WHERE b.status IN ('MISMATCH', 'MISSING_EXTERNAL_OBSERVATION')
+  AND r.id = (
+      SELECT latest.id FROM reconcile_runs latest
+      WHERE latest.reconcile_account_id = r.reconcile_account_id
+        AND latest.reconciliation_type IN ('BALANCE', 'FULL')
+        AND latest.status = 'COMPLETED'
+      ORDER BY latest.completed_at DESC, latest.id DESC LIMIT 1
+  )
+UNION ALL
+SELECT a.name,
+       'DUPLICATE_EXTERNAL'::text,
+       a.asset_identity,
+       NULL::numeric,
+       e.external_reference,
+       clock_timestamp() - max(e.event_at),
+       'ERROR'::text,
+       latest.id
+FROM reconcile_external_transactions e
+JOIN reconcile_accounts a ON a.id = e.reconcile_account_id
+JOIN LATERAL (
+    SELECT r.id
+    FROM reconcile_runs r
+    WHERE r.reconcile_account_id = e.reconcile_account_id
+      AND r.reconciliation_type IN ('TRANSACTIONS', 'FULL')
+      AND r.status = 'COMPLETED'
+    ORDER BY r.completed_at DESC, r.id DESC
+    LIMIT 1
+) latest ON true
+WHERE e.external_reference IS NOT NULL
+  AND e.supersedes_id IS NULL
+GROUP BY a.id, a.name, a.asset_identity, e.external_reference, latest.id
+HAVING count(DISTINCT e.payload_hash) > 1
 UNION ALL
 SELECT a.name,
        CASE m.status
@@ -72,7 +129,14 @@ FROM reconcile_matches m
 JOIN reconcile_runs r ON r.id = m.run_id
 JOIN reconcile_accounts a ON a.id = r.reconcile_account_id
 LEFT JOIN reconcile_external_transactions e ON e.id = m.external_transaction_id
-WHERE m.status IN ('UNMATCHED_EXTERNAL', 'UNMATCHED_LEDGER', 'AMBIGUOUS', 'CONFLICT');
+WHERE m.status IN ('UNMATCHED_EXTERNAL', 'UNMATCHED_LEDGER', 'AMBIGUOUS', 'CONFLICT')
+  AND r.id = (
+      SELECT latest.id FROM reconcile_runs latest
+      WHERE latest.reconcile_account_id = r.reconcile_account_id
+        AND latest.reconciliation_type IN ('TRANSACTIONS', 'FULL')
+        AND latest.status = 'COMPLETED'
+      ORDER BY latest.completed_at DESC, latest.id DESC LIMIT 1
+  );
 
 CREATE VIEW reconcile_run_summary AS
 SELECT r.id AS run_id, r.reconcile_account_id, a.name AS account,

@@ -35,36 +35,46 @@ BEGIN
     );
 
     EXECUTE format(
-        'CREATE OR REPLACE FUNCTION %1$I._reconcile_ledger_balance_at(account_id uuid, at_time timestamptz) '
+        'CREATE OR REPLACE FUNCTION %1$I._reconcile_ledger_balance_at('
+        'account_id uuid, at_time timestamptz, evidence_created_cutoff timestamptz) '
         'RETURNS TABLE(balance_units numeric, boundary jsonb) LANGUAGE sql STABLE PARALLEL RESTRICTED '
         'SET search_path = %1$I, pg_catalog AS %2$L',
         reconcile_schema,
         format(
             'SELECT coalesce(sum(%1$I.ledger_amount_units(e.amount)), 0)::numeric, '
             'jsonb_build_object(''through_event_at'', max(t.event_at), '
-            '''through_transaction_id'', max(t.id::text), ''as_of'', $2, '
+            '''through_transaction_id'', '
+            '(array_agg(t.id::text ORDER BY t.event_at DESC, t.created_at DESC, t.id DESC) '
+            'FILTER (WHERE t.id IS NOT NULL))[1], ''through_created_at'', '
+            '(array_agg(t.created_at::text ORDER BY t.event_at DESC, t.created_at DESC, t.id DESC) '
+            'FILTER (WHERE t.id IS NOT NULL))[1], ''as_of'', $2, '
+            '''evidence_created_cutoff'', $3, '
             '''entry_count'', count(e.id)) '
             'FROM %1$I.ledger_accounts a '
             'LEFT JOIN (%1$I.ledger_entries e JOIN %1$I.ledger_transactions t '
-            'ON t.id = e.transaction_id AND t.event_at <= $2) ON e.account_id = a.id '
+            'ON t.id = e.transaction_id AND t.event_at <= $2 AND t.created_at <= $3) '
+            'ON e.account_id = a.id '
             'WHERE a.id = $1 GROUP BY a.id',
             ledger_schema
         )
     );
 
     EXECUTE format(
-        'CREATE OR REPLACE FUNCTION %1$I._reconcile_ledger_candidates(account_id uuid, through_time timestamptz) '
+        'CREATE OR REPLACE FUNCTION %1$I._reconcile_ledger_candidates('
+        'account_id uuid, through_time timestamptz, evidence_created_cutoff timestamptz) '
         'RETURNS TABLE(ledger_transaction_id uuid, ledger_entry_id uuid, amount_units numeric, '
         'asset_identity text, event_at timestamptz, reference text, metadata jsonb) '
         'LANGUAGE sql STABLE PARALLEL RESTRICTED SET search_path = %1$I, pg_catalog AS %2$L',
         reconcile_schema,
         format(
             'SELECT t.id, e.id, %1$I.ledger_amount_units(e.amount), '
-            '%2$I.reconcile_asset(a.asset::text), t.event_at, t.reference, t.metadata '
+            '%2$I.reconcile_asset(a.asset::text), t.event_at, t.reference, '
+            'coalesce(t.metadata, ''{}''::jsonb) || jsonb_strip_nulls(jsonb_build_object('
+            '''reverses_transaction_id'', t.reverses_transaction_id::text)) '
             'FROM %1$I.ledger_entries e '
             'JOIN %1$I.ledger_transactions t ON t.id = e.transaction_id '
             'JOIN %1$I.ledger_accounts a ON a.id = e.account_id '
-            'WHERE e.account_id = $1 AND t.event_at <= $2 '
+            'WHERE e.account_id = $1 AND t.event_at <= $2 AND t.created_at <= $3 '
             'ORDER BY t.event_at, t.id, e.id',
             ledger_schema, reconcile_schema
         )
@@ -139,6 +149,17 @@ BEGIN
             format('SELECT %I.reconcile_external_transaction_insert($1, $2, $3::text, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)',
                    reconcile_schema)
         );
+        PERFORM _reconcile_attach_function(to_regprocedure(format(
+            '%I.reconcile_asset(%s)', reconcile_schema, money_type::text
+        )));
+        PERFORM _reconcile_attach_function(to_regprocedure(format(
+            '%I.reconcile_balance_insert(uuid,%s,timestamptz,text,text,timestamptz,jsonb,text)',
+            reconcile_schema, money_type::text
+        )));
+        PERFORM _reconcile_attach_function(to_regprocedure(format(
+            '%I.reconcile_external_transaction_insert(uuid,text,%s,%I.reconcile_direction,timestamptz,%I.reconcile_external_status,timestamptz,text,text,text,jsonb,text,uuid,uuid)',
+            reconcile_schema, money_type::text, reconcile_schema, reconcile_schema
+        )));
         EXECUTE format(
             'REVOKE ALL ON FUNCTION %I.reconcile_asset(%s) FROM PUBLIC',
             reconcile_schema, money_type::text
@@ -255,6 +276,17 @@ BEGIN
             reconcile_schema, crypto_schema
         )
     );
+    PERFORM _reconcile_attach_function(to_regprocedure(format(
+        '%I.reconcile_asset(%I.crypto_asset)', reconcile_schema, crypto_schema
+    )));
+    PERFORM _reconcile_attach_function(to_regprocedure(format(
+        '%I.reconcile_balance_insert(uuid,%I.crypto_amount,timestamptz,text,text,timestamptz,jsonb,text)',
+        reconcile_schema, crypto_schema
+    )));
+    PERFORM _reconcile_attach_function(to_regprocedure(format(
+        '%1$I.reconcile_external_transaction_insert(uuid,text,%2$I.crypto_amount,%1$I.reconcile_direction,timestamptz,%1$I.reconcile_external_status,timestamptz,text,text,text,jsonb,text,uuid,uuid)',
+        reconcile_schema, crypto_schema
+    )));
     EXECUTE format(
         'REVOKE ALL ON FUNCTION %I.reconcile_asset(%I.crypto_asset) FROM PUBLIC',
         reconcile_schema, crypto_schema

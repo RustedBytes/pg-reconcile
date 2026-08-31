@@ -26,6 +26,12 @@ cargo pgrx install --pg-config "$pg_config" --no-default-features --features "pg
 "$pg_bindir/createdb" -h "$test_root" -p "$test_port" pg_reconcile_test
 "$pg_bindir/psql" -X -v ON_ERROR_STOP=1 -h "$test_root" -p "$test_port" \
     -d pg_reconcile_test -f "$project_dir/ci/smoke.sql"
+"$pg_bindir/createdb" -h "$test_root" -p "$test_port" pg_reconcile_security
+"$pg_bindir/psql" -X -v ON_ERROR_STOP=1 -h "$test_root" -p "$test_port" \
+    -d pg_reconcile_security -f "$project_dir/ci/security.sql"
+"$pg_bindir/createdb" -h "$test_root" -p "$test_port" pg_reconcile_matching_edge
+"$pg_bindir/psql" -X -v ON_ERROR_STOP=1 -h "$test_root" -p "$test_port" \
+    -d pg_reconcile_matching_edge -f "$project_dir/ci/matching-edge.sql"
 "$pg_bindir/createdb" -h "$test_root" -p "$test_port" pg_reconcile_schema_test
 "$pg_bindir/psql" -X -v ON_ERROR_STOP=1 -h "$test_root" -p "$test_port" \
     -d pg_reconcile_schema_test -f "$project_dir/ci/custom-schema.sql"

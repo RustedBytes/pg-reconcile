@@ -112,6 +112,47 @@ BEGIN
 END
 $body$;
 
+-- Volatile received_at defaults do not turn an otherwise identical retry into
+-- a different canonical payload. The first receipt time remains immutable.
+DO $body$
+DECLARE
+    first_balance uuid;
+    retried_balance uuid;
+    first_transaction uuid;
+    retried_transaction uuid;
+BEGIN
+    first_balance := reconcile_balance_insert(
+        reconcile_account_id => current_setting('smoke.reconcile_id')::uuid,
+        balance => 'USD 0.00', observed_at => '2026-08-31 11:00:00+00',
+        external_reference => 'statement:default-retry',
+        idempotency_key => 'balance:default-retry'
+    );
+    retried_balance := reconcile_balance_insert(
+        reconcile_account_id => current_setting('smoke.reconcile_id')::uuid,
+        balance => 'USD 0.00', observed_at => '2026-08-31 11:00:00+00',
+        external_reference => 'statement:default-retry',
+        idempotency_key => 'balance:default-retry'
+    );
+    ASSERT first_balance = retried_balance;
+
+    first_transaction := reconcile_external_transaction_insert(
+        reconcile_account_id => current_setting('smoke.reconcile_id')::uuid,
+        external_transaction_id => 'provider:default-retry',
+        amount => 'USD 1.00', direction => 'CREDIT',
+        event_at => '2026-08-31 11:00:00+00', status => 'FAILED',
+        idempotency_key => 'external:default-retry'
+    );
+    retried_transaction := reconcile_external_transaction_insert(
+        reconcile_account_id => current_setting('smoke.reconcile_id')::uuid,
+        external_transaction_id => 'provider:default-retry',
+        amount => 'USD 1.00', direction => 'CREDIT',
+        event_at => '2026-08-31 11:00:00+00', status => 'FAILED',
+        idempotency_key => 'external:default-retry'
+    );
+    ASSERT first_transaction = retried_transaction;
+END
+$body$;
+
 SELECT reconcile_external_transaction_insert(
     :'reconcile_id', 'provider:deposit:1', 'USD 100.00', 'CREDIT',
     '2026-08-31 12:00:00+00', 'SETTLED', '2026-08-31 12:00:02+00',
@@ -158,14 +199,14 @@ $body$;
 SELECT reconcile_external_transaction_insert(
     :'reconcile_id', 'provider:deposit:2', 'USD 20.00', 'CREDIT',
     '2026-08-31 13:00:01+00', 'PENDING', '2026-08-31 13:00:02+00',
-    NULL, NULL, NULL, NULL, 'external:2:pending'
+    NULL, NULL, 'bank:deposit:2', NULL, 'external:2:pending'
 ) AS pending_external \gset
 SELECT set_config('smoke.pending_external', :'pending_external', false);
 
 SELECT reconcile_external_transaction_insert(
     :'reconcile_id', 'provider:deposit:2', 'USD 20.00', 'CREDIT',
     '2026-08-31 13:00:01+00', 'SETTLED', '2026-08-31 13:01:00+00',
-    NULL, NULL, NULL, NULL, 'external:2:settled', NULL, :'pending_external'
+    NULL, NULL, 'bank:deposit:2', NULL, 'external:2:settled', NULL, :'pending_external'
 ) AS settled_external \gset
 SELECT set_config('smoke.settled_external', :'settled_external', false);
 
@@ -196,6 +237,42 @@ BEGIN
         SELECT 1 FROM reconcile_matches
         WHERE run_id = latest_run
           AND external_transaction_id = current_setting('smoke.pending_external')::uuid
+    );
+END
+$body$;
+
+-- A successor whose event is after as_of must not hide the qualifying prior
+-- observation merely because it was received before the run started.
+SELECT reconcile_external_transaction_insert(
+    :'reconcile_id', 'provider:future-progression', 'USD 11.00', 'CREDIT',
+    '2026-08-31 18:00:00+00', 'PENDING', '2026-08-31 14:00:00+00',
+    NULL, NULL, NULL, NULL, 'external:future:pending'
+) AS future_pending \gset
+SELECT reconcile_external_transaction_insert(
+    :'reconcile_id', 'provider:future-progression', 'USD 11.00', 'CREDIT',
+    '2026-08-31 20:00:00+00', 'SETTLED', '2026-08-31 14:01:00+00',
+    NULL, NULL, NULL, NULL, 'external:future:settled', NULL, :'future_pending'
+) AS future_settled \gset
+SELECT count(*) FROM reconcile_transactions(:'reconcile_id', '2026-08-31 18:30:00+00');
+SELECT set_config('smoke.future_pending', :'future_pending', false);
+SELECT set_config('smoke.future_settled', :'future_settled', false);
+
+DO $body$
+DECLARE
+    latest_run uuid;
+BEGIN
+    SELECT id INTO latest_run FROM reconcile_runs
+    WHERE reconciliation_type = 'TRANSACTIONS' ORDER BY started_at DESC, id DESC LIMIT 1;
+    ASSERT EXISTS (
+        SELECT 1 FROM reconcile_matches
+        WHERE run_id = latest_run
+          AND external_transaction_id = current_setting('smoke.future_pending')::uuid
+          AND status = 'UNMATCHED_EXTERNAL'
+    );
+    ASSERT NOT EXISTS (
+        SELECT 1 FROM reconcile_matches
+        WHERE run_id = latest_run
+          AND external_transaction_id = current_setting('smoke.future_settled')::uuid
     );
 END
 $body$;
@@ -237,7 +314,7 @@ BEGIN
         SELECT 1 FROM reconcile_matches
         WHERE run_id = latest_run
           AND external_transaction_id = current_setting('smoke.reversal_external')::uuid
-          AND status = 'EXACT' AND reason->>'strategy' = 'explicit_reference'
+          AND status = 'EXACT' AND reason->>'strategy' = 'linked_reversal'
     );
     ASSERT EXISTS (
         SELECT 1 FROM reconcile_matches
@@ -254,6 +331,12 @@ SELECT reconcile_create_account(
     'treasury-bank-usd-empty', :'mapped_id', 'USD', 'test-bank', 'account-empty',
     'BANK', 'BOOK', 0
 ) AS empty_reconcile_id \gset
+
+-- An observation after as_of is not eligible, even if it was already received.
+SELECT reconcile_balance_insert(
+    :'empty_reconcile_id', 'USD 120.00', '2026-08-31 13:00:00+00',
+    'statement:future', NULL, '2026-08-31 13:00:01+00', NULL, 'balance:future'
+) AS future_balance_observation \gset
 
 SELECT (reconcile_balance(:'empty_reconcile_id', '2026-08-31 12:30:00+00')).status
        AS empty_balance_status \gset
@@ -314,6 +397,27 @@ SELECT reconcile_external_transaction_insert(
 ) AS manual_external \gset
 SELECT set_config('smoke.manual_external', :'manual_external', false);
 SELECT reconcile_match_manual(:'manual_external', :'manual_ledger', 'operator verified statement');
+SELECT reconcile_external_transaction_insert(
+    :'reconcile_id', 'provider:manual:collision', 'USD 7.00', 'CREDIT',
+    '2026-08-31 18:00:01+00', 'SETTLED', '2026-08-31 14:00:02+00',
+    NULL, NULL, NULL, NULL, 'external:manual:collision'
+) AS manual_collision_external \gset
+SELECT set_config('smoke.manual_collision_external', :'manual_collision_external', false);
+SELECT set_config('smoke.manual_ledger', :'manual_ledger', false);
+DO $body$
+BEGIN
+    BEGIN
+        PERFORM reconcile_match_manual(
+            current_setting('smoke.manual_collision_external')::uuid,
+            current_setting('smoke.manual_ledger')::uuid,
+            'must not reuse ledger entry'
+        );
+        ASSERT false, 'one ledger entry must not be manually assigned to two external items';
+    EXCEPTION WHEN SQLSTATE 'PGR08' THEN
+        NULL;
+    END;
+END
+$body$;
 SELECT count(*) FROM reconcile_transactions(:'reconcile_id', '2026-08-31 18:10:00+00');
 
 DO $body$
@@ -340,6 +444,17 @@ BEGIN
         WHERE r.reconciliation_type = 'FULL' AND r.status = 'COMPLETED'
           AND EXISTS (SELECT 1 FROM reconcile_balance_results b WHERE b.run_id = r.id)
           AND EXISTS (SELECT 1 FROM reconcile_matches m WHERE m.run_id = r.id)
+    );
+END
+$body$;
+
+DO $body$
+BEGIN
+    ASSERT 2 = (
+        SELECT count(*) FROM reconcile_all('test-bank', '2026-08-31 18:10:00+00')
+    );
+    ASSERT 2 = (
+        SELECT count(*) FROM reconcile_all_enabled('2026-08-31 18:10:00+00')
     );
 END
 $body$;
@@ -377,7 +492,16 @@ END
 $body$;
 
 DO $body$
+DECLARE
+    error_detail text;
 BEGIN
+    BEGIN
+        PERFORM reconcile_asset('invalid asset');
+        ASSERT false, 'invalid canonical asset should fail';
+    EXCEPTION WHEN invalid_parameter_value THEN
+        GET STACKED DIAGNOSTICS error_detail = PG_EXCEPTION_DETAIL;
+        ASSERT error_detail = 'RECONCILE_ASSET_MISMATCH';
+    END;
     ASSERT NOT EXISTS (SELECT 1 FROM reconcile_validate() WHERE status <> 'OK');
     ASSERT EXISTS (SELECT 1 FROM reconcile_issues WHERE issue_type = 'BALANCE_MISMATCH');
 END

@@ -75,6 +75,7 @@ cargo clippy --all-targets --no-default-features --features pg18 -- \
 ./ci/test-upgrade.sh
 ./ci/test-extension.sh "$(cargo pgrx info pg-config 18)"
 ./ci/test-interoperability.sh "$(cargo pgrx info pg-config 18)"
+./ci/test-full-stack.sh "$(cargo pgrx info pg-config 18)"
 ./ci/test-highload.sh "$(cargo pgrx info pg-config 18)"
 ```
 

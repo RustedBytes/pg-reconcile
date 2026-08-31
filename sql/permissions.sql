@@ -77,7 +77,8 @@ BEGIN
             text, uuid, text, text, text, reconcile_account_kind,
             reconcile_balance_mode, text, jsonb, interval, boolean, integer
         ), reconcile_enable_pg_ledger(), reconcile_enable_pg_money(),
-           reconcile_enable_pg_cryptocurrency(), reconcile_validate()
+           reconcile_enable_pg_cryptocurrency(), reconcile_account(uuid),
+           reconcile_account(text), reconcile_validate()
         TO reconcile_admin;
     END IF;
 END

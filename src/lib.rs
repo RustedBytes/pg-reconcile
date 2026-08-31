@@ -3,6 +3,7 @@ mod asset;
 mod errors;
 mod idempotency;
 mod matching;
+mod reconciliation;
 mod validation;
 
 use pgrx::prelude::*;
@@ -114,7 +115,9 @@ extension_sql_file!(
         amount::reconcile_amount_units,
         amount::reconcile_format_amount,
         idempotency::reconcile_payload_hash,
+        matching::reconcile_external_reference_keys,
         matching::reconcile_timestamp_score,
+        reconciliation::_reconcile_execute_run_rust,
         validation::_reconcile_validate_rust
     ]
 );

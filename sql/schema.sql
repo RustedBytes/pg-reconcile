@@ -232,7 +232,11 @@ LANGUAGE sql STABLE PARALLEL SAFE
 SET search_path = @extschema@, pg_catalog
 AS 'SELECT NULL::text WHERE false';
 
-CREATE FUNCTION _reconcile_ledger_balance_at(account_id uuid, at_time timestamptz)
+CREATE FUNCTION _reconcile_ledger_balance_at(
+    account_id uuid,
+    at_time timestamptz,
+    evidence_created_cutoff timestamptz
+)
 RETURNS TABLE(balance_units numeric, boundary jsonb)
 LANGUAGE plpgsql STABLE PARALLEL RESTRICTED
 SET search_path = @extschema@, pg_catalog
@@ -245,7 +249,8 @@ $body$;
 
 CREATE FUNCTION _reconcile_ledger_candidates(
     account_id uuid,
-    through_time timestamptz
+    through_time timestamptz,
+    evidence_created_cutoff timestamptz
 ) RETURNS TABLE(
     ledger_transaction_id uuid,
     ledger_entry_id uuid,
@@ -261,6 +266,36 @@ AS $body$
 BEGIN
     RAISE EXCEPTION 'pg_ledger adapter is not enabled'
         USING ERRCODE = 'PGR09', DETAIL = 'RECONCILE_LEDGER_ADAPTER_MISSING';
+END
+$body$;
+
+-- Dynamically created optional-adapter overloads must belong to this
+-- extension even when the peer extension is installed later. Otherwise they
+-- become orphaned objects and prevent DROP EXTENSION pg_reconcile.
+CREATE FUNCTION _reconcile_attach_function(function_oid regprocedure)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = @extschema@, pg_catalog
+AS $body$
+DECLARE
+    extension_oid oid;
+BEGIN
+    IF function_oid IS NULL THEN
+        RAISE EXCEPTION 'cannot attach a missing adapter function'
+            USING ERRCODE = 'PGR09', DETAIL = 'RECONCILE_LEDGER_ADAPTER_MISSING';
+    END IF;
+    SELECT oid INTO extension_oid FROM pg_extension WHERE extname = 'pg_reconcile';
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_depend
+        WHERE classid = 'pg_proc'::regclass
+          AND objid = function_oid::oid
+          AND refclassid = 'pg_extension'::regclass
+          AND refobjid = extension_oid
+          AND deptype = 'e'
+    ) THEN
+        EXECUTE format('ALTER EXTENSION pg_reconcile ADD FUNCTION %s', function_oid);
+    END IF;
 END
 $body$;
 
@@ -400,7 +435,7 @@ BEGIN
     fingerprint := decode(reconcile_payload_hash(jsonb_build_object(
         'v', 1, 'kind', 'balance', 'account', reconcile_account_id,
         'units', amount_units::text, 'asset', amount_asset,
-        'observed_at', observed_at, 'received_at', received_at,
+        'observed_at', observed_at,
         'external_reference', external_reference, 'source_sequence', source_sequence,
         'metadata', metadata
     )), 'hex');
@@ -487,25 +522,33 @@ BEGIN
         WHERE id = reconcile_external_transaction_insert.supersedes_id FOR KEY SHARE;
         IF predecessor.id IS NULL OR predecessor.reconcile_account_id <> reconcile_account_id OR
            predecessor.external_transaction_id <> external_transaction_id OR
-           predecessor.asset_identity <> amount_asset THEN
+           predecessor.asset_identity <> amount_asset OR
+           predecessor.event_at > event_at OR predecessor.received_at > received_at THEN
             RAISE EXCEPTION 'superseded observation must be the same logical external transaction'
                 USING ERRCODE = 'PGR03', DETAIL = 'RECONCILE_EXTERNAL_DUPLICATE';
         END IF;
     END IF;
-    IF reconcile_external_transaction_insert.reverses_external_transaction_id IS NOT NULL AND NOT EXISTS (
-        SELECT 1 FROM reconcile_external_transactions e
+    IF reconcile_external_transaction_insert.reverses_external_transaction_id IS NOT NULL THEN
+        SELECT * INTO predecessor
+        FROM reconcile_external_transactions e
         WHERE e.id = reconcile_external_transaction_insert.reverses_external_transaction_id
-          AND e.reconcile_account_id = reconcile_external_transaction_insert.reconcile_account_id
-          AND e.asset_identity = amount_asset
-    ) THEN
-        RAISE EXCEPTION 'reversed external transaction is missing or incompatible'
-            USING ERRCODE = '22023', DETAIL = 'RECONCILE_MALFORMED_EXTERNAL';
+        FOR KEY SHARE;
+        IF predecessor.id IS NULL OR
+           predecessor.reconcile_account_id <> reconcile_account_id OR
+           predecessor.asset_identity <> amount_asset OR
+           predecessor.amount_units <> amount_units OR
+           predecessor.direction = direction OR
+           predecessor.event_at > event_at OR
+           status <> 'REVERSED' THEN
+            RAISE EXCEPTION 'reversal must be REVERSED and negate a compatible external transaction'
+                USING ERRCODE = '22023', DETAIL = 'RECONCILE_MALFORMED_EXTERNAL';
+        END IF;
     END IF;
     fingerprint := decode(reconcile_payload_hash(jsonb_build_object(
         'v', 1, 'kind', 'transaction', 'account', reconcile_account_id,
         'external_transaction_id', external_transaction_id,
         'units', amount_units::text, 'asset', amount_asset, 'direction', direction,
-        'event_at', event_at, 'received_at', received_at, 'status', status,
+        'event_at', event_at, 'status', status,
         'counterparty', counterparty, 'description', description,
         'external_reference', external_reference, 'metadata', metadata,
         'reverses', reverses_external_transaction_id, 'supersedes', supersedes_id
@@ -630,12 +673,6 @@ BEGIN
     END IF;
     SELECT * INTO account_row FROM reconcile_accounts WHERE id = run_row.reconcile_account_id;
 
-    SELECT b.balance_units, b.boundary INTO ledger_balance, ledger_boundary
-    FROM _reconcile_ledger_balance_at(account_row.ledger_account_id, run_row.as_of) b;
-    IF ledger_balance IS NULL THEN
-        RAISE EXCEPTION 'mapped ledger account no longer exists'
-            USING ERRCODE = 'PGR01', DETAIL = 'RECONCILE_ACCOUNT_NOT_FOUND';
-    END IF;
     SELECT * INTO observation
     FROM reconcile_balance_observations o
     WHERE o.reconcile_account_id = run_row.reconcile_account_id
@@ -643,6 +680,16 @@ BEGIN
       AND o.received_at <= run_row.evidence_received_cutoff
     ORDER BY o.observed_at DESC, o.received_at DESC, o.id DESC
     LIMIT 1;
+    SELECT b.balance_units, b.boundary INTO ledger_balance, ledger_boundary
+    FROM _reconcile_ledger_balance_at(
+        account_row.ledger_account_id,
+        coalesce(observation.observed_at, run_row.as_of),
+        run_row.evidence_received_cutoff
+    ) b;
+    IF ledger_balance IS NULL THEN
+        RAISE EXCEPTION 'mapped ledger account no longer exists'
+            USING ERRCODE = 'PGR01', DETAIL = 'RECONCILE_ACCOUNT_NOT_FOUND';
+    END IF;
     IF observation.id IS NULL THEN
         INSERT INTO reconcile_balance_results (
             run_id, ledger_balance_units, tolerance_units, status, ledger_boundary
@@ -679,9 +726,7 @@ DECLARE
     new_run uuid;
     result reconcile_balance_results%ROWTYPE;
 BEGIN
-    new_run := _reconcile_start_run(account_id, 'BALANCE', as_of);
-    PERFORM _reconcile_balance_into_run(new_run);
-    PERFORM _reconcile_finish_run(new_run);
+    new_run := _reconcile_execute_run_rust(account_id, 'BALANCE', as_of);
     SELECT * INTO result FROM reconcile_balance_results WHERE run_id = new_run;
     RETURN result;
 END
@@ -702,6 +747,8 @@ DECLARE
     candidate_count bigint;
     compatible_count bigint;
     signed_units numeric;
+    reference_keys text[];
+    reversed_ledger_transaction uuid;
     inserted_count bigint := 0;
 BEGIN
     SELECT * INTO run_row FROM reconcile_runs WHERE id = p_run_id AND status = 'RUNNING';
@@ -726,7 +773,9 @@ BEGIN
     ) ON COMMIT DROP;
     TRUNCATE pg_temp.reconcile_candidate_cache;
     INSERT INTO pg_temp.reconcile_candidate_cache
-    SELECT * FROM _reconcile_ledger_candidates(account_row.ledger_account_id, run_row.as_of);
+    SELECT * FROM _reconcile_ledger_candidates(
+        account_row.ledger_account_id, run_row.as_of, run_row.evidence_received_cutoff
+    );
     CREATE INDEX IF NOT EXISTS reconcile_candidate_cache_reference_idx
         ON pg_temp.reconcile_candidate_cache (reference);
     CREATE INDEX IF NOT EXISTS reconcile_candidate_cache_asset_amount_time_idx
@@ -737,7 +786,43 @@ BEGIN
         ON pg_temp.reconcile_candidate_cache ((metadata->>'external_reference'));
     CREATE INDEX IF NOT EXISTS reconcile_candidate_cache_provider_ref_idx
         ON pg_temp.reconcile_candidate_cache ((metadata->>'provider_reference'));
+    CREATE INDEX IF NOT EXISTS reconcile_candidate_cache_txid_idx
+        ON pg_temp.reconcile_candidate_cache ((metadata->>'txid'));
+    CREATE INDEX IF NOT EXISTS reconcile_candidate_cache_txid_output_idx
+        ON pg_temp.reconcile_candidate_cache (
+            (((metadata->>'txid') || ':' || (metadata->>'output_index')))
+        );
+    CREATE INDEX IF NOT EXISTS reconcile_candidate_cache_tx_hash_idx
+        ON pg_temp.reconcile_candidate_cache ((metadata->>'tx_hash'));
+    CREATE INDEX IF NOT EXISTS reconcile_candidate_cache_tx_hash_log_idx
+        ON pg_temp.reconcile_candidate_cache (
+            (((metadata->>'tx_hash') || ':' || (metadata->>'log_index')))
+        );
     ANALYZE pg_temp.reconcile_candidate_cache;
+
+    CREATE TEMP TABLE IF NOT EXISTS reconcile_manual_cache (
+        id uuid PRIMARY KEY,
+        external_transaction_id uuid NOT NULL UNIQUE,
+        ledger_transaction_id uuid,
+        ledger_entry_id uuid,
+        decision reconcile_manual_decision NOT NULL,
+        actor text NOT NULL
+    ) ON COMMIT DROP;
+    TRUNCATE pg_temp.reconcile_manual_cache;
+    INSERT INTO pg_temp.reconcile_manual_cache (
+        id, external_transaction_id, ledger_transaction_id, ledger_entry_id, decision, actor
+    )
+    SELECT DISTINCT ON (d.external_transaction_id)
+           d.id, d.external_transaction_id, d.ledger_transaction_id,
+           d.ledger_entry_id, d.decision, d.actor
+    FROM reconcile_manual_decisions d
+    JOIN reconcile_external_transactions e ON e.id = d.external_transaction_id
+    WHERE e.reconcile_account_id = run_row.reconcile_account_id
+      AND d.created_at <= run_row.evidence_received_cutoff
+    ORDER BY d.external_transaction_id, d.created_at DESC, d.id DESC;
+    CREATE UNIQUE INDEX IF NOT EXISTS reconcile_manual_cache_ledger_match_idx
+        ON pg_temp.reconcile_manual_cache (ledger_entry_id)
+        WHERE decision = 'MATCH';
 
     FOR external_row IN
         SELECT e.*
@@ -750,6 +835,7 @@ BEGIN
               SELECT 1 FROM reconcile_external_transactions successor
               WHERE successor.supersedes_id = e.id
                 AND successor.received_at <= run_row.evidence_received_cutoff
+                AND successor.event_at <= run_row.as_of
           )
         ORDER BY e.event_at, e.id
     LOOP
@@ -757,14 +843,28 @@ BEGIN
             WHEN 'CREDIT' THEN external_row.amount_units
             ELSE -external_row.amount_units
         END;
+        reference_keys := reconcile_external_reference_keys(
+            external_row.external_transaction_id,
+            external_row.external_reference,
+            external_row.metadata
+        );
 
-        SELECT * INTO manual_row
-        FROM reconcile_manual_decisions d
-        WHERE d.external_transaction_id = external_row.id
-        ORDER BY d.created_at DESC, d.id DESC
-        LIMIT 1;
+        SELECT d.* INTO manual_row
+        FROM pg_temp.reconcile_manual_cache c
+        JOIN reconcile_manual_decisions d ON d.id = c.id
+        WHERE c.external_transaction_id = external_row.id;
         IF manual_row.id IS NOT NULL THEN
             IF manual_row.decision = 'MATCH' THEN
+                IF EXISTS (
+                    SELECT 1 FROM reconcile_matches m
+                    WHERE m.run_id = p_run_id
+                      AND m.ledger_entry_id = manual_row.ledger_entry_id
+                      AND m.status IN ('EXACT', 'PROBABLE')
+                      AND m.external_transaction_id IS DISTINCT FROM external_row.id
+                ) THEN
+                    RAISE EXCEPTION 'manual match reuses a ledger entry already matched in this run'
+                        USING ERRCODE = 'PGR08', DETAIL = 'RECONCILE_INVALID_MANUAL_MATCH';
+                END IF;
                 INSERT INTO reconcile_matches (
                     run_id, external_transaction_id, ledger_transaction_id, ledger_entry_id,
                     status, score, reason
@@ -788,6 +888,109 @@ BEGIN
             CONTINUE;
         END IF;
 
+        -- A linked external reversal is first paired with a ledger reversal of
+        -- the transaction matched to the original external item. This keeps
+        -- reversal semantics stronger than a coincidental amount/time match.
+        IF external_row.reverses_external_transaction_id IS NOT NULL THEN
+            SELECT m.ledger_transaction_id INTO reversed_ledger_transaction
+            FROM reconcile_matches m
+            WHERE m.run_id = p_run_id
+              AND m.external_transaction_id = external_row.reverses_external_transaction_id
+              AND m.status IN ('EXACT', 'PROBABLE')
+            ORDER BY m.created_at, m.id
+            LIMIT 1;
+            IF reversed_ledger_transaction IS NOT NULL THEN
+                SELECT count(*), count(*) FILTER (
+                    WHERE c.asset_identity = external_row.asset_identity
+                      AND c.amount_units = signed_units
+                ) INTO candidate_count, compatible_count
+                FROM pg_temp.reconcile_candidate_cache c
+                WHERE c.metadata->>'reverses_transaction_id' = reversed_ledger_transaction::text;
+                IF compatible_count = 1 THEN
+                    SELECT c.* INTO candidate
+                    FROM pg_temp.reconcile_candidate_cache c
+                    WHERE c.metadata->>'reverses_transaction_id' = reversed_ledger_transaction::text
+                      AND c.asset_identity = external_row.asset_identity
+                      AND c.amount_units = signed_units
+                    LIMIT 1;
+                    IF EXISTS (
+                        SELECT 1 FROM reconcile_matches m
+                        WHERE m.run_id = p_run_id
+                          AND m.ledger_entry_id = candidate.ledger_entry_id
+                          AND m.status IN ('EXACT', 'PROBABLE')
+                    ) OR EXISTS (
+                        SELECT 1 FROM pg_temp.reconcile_manual_cache reserved
+                        WHERE reserved.decision = 'MATCH'
+                          AND reserved.ledger_entry_id = candidate.ledger_entry_id
+                          AND reserved.external_transaction_id <> external_row.id
+                    ) THEN
+                        INSERT INTO reconcile_matches (
+                            run_id, external_transaction_id, ledger_transaction_id,
+                            ledger_entry_id, status, score, reason
+                        ) VALUES (
+                            p_run_id, external_row.id, candidate.ledger_transaction_id,
+                            candidate.ledger_entry_id, 'CONFLICT', 200,
+                            jsonb_build_object('strategy', 'linked_reversal',
+                                               'conflict', 'candidate_already_matched')
+                        );
+                        inserted_count := inserted_count + 1;
+                        CONTINUE;
+                    END IF;
+                    INSERT INTO reconcile_matches (
+                        run_id, external_transaction_id, ledger_transaction_id,
+                        ledger_entry_id, status, score, reason
+                    ) VALUES (
+                        p_run_id, external_row.id, candidate.ledger_transaction_id,
+                        candidate.ledger_entry_id, 'EXACT', 200,
+                        jsonb_build_object('strategy', 'linked_reversal',
+                            'reverses_external_transaction_id',
+                            external_row.reverses_external_transaction_id,
+                            'reverses_ledger_transaction_id', reversed_ledger_transaction)
+                    );
+                    inserted_count := inserted_count + 1;
+                    CONTINUE;
+                ELSIF compatible_count > 1 THEN
+                    FOR candidate IN
+                        SELECT c.* FROM pg_temp.reconcile_candidate_cache c
+                        WHERE c.metadata->>'reverses_transaction_id' = reversed_ledger_transaction::text
+                          AND c.asset_identity = external_row.asset_identity
+                          AND c.amount_units = signed_units
+                    LOOP
+                        INSERT INTO reconcile_matches (
+                            run_id, external_transaction_id, ledger_transaction_id,
+                            ledger_entry_id, status, score, reason
+                        ) VALUES (
+                            p_run_id, external_row.id, candidate.ledger_transaction_id,
+                            candidate.ledger_entry_id, 'AMBIGUOUS', 200,
+                            jsonb_build_object('strategy', 'linked_reversal',
+                                               'candidate_count', compatible_count)
+                        );
+                        inserted_count := inserted_count + 1;
+                    END LOOP;
+                    CONTINUE;
+                ELSIF candidate_count > 0 THEN
+                    SELECT c.* INTO candidate
+                    FROM pg_temp.reconcile_candidate_cache c
+                    WHERE c.metadata->>'reverses_transaction_id' = reversed_ledger_transaction::text
+                    LIMIT 1;
+                    INSERT INTO reconcile_matches (
+                        run_id, external_transaction_id, ledger_transaction_id,
+                        ledger_entry_id, status, score, reason
+                    ) VALUES (
+                        p_run_id, external_row.id, candidate.ledger_transaction_id,
+                        candidate.ledger_entry_id, 'CONFLICT', 200,
+                        jsonb_build_object('strategy', 'linked_reversal',
+                            'external_asset', external_row.asset_identity,
+                            'ledger_asset', candidate.asset_identity,
+                            'external_units', signed_units::text,
+                            'ledger_units', candidate.amount_units::text)
+                    );
+                    inserted_count := inserted_count + 1;
+                    CONTINUE;
+                END IF;
+            END IF;
+        END IF;
+
         -- Level 1: a strong provider/reference mapping. A reused strong reference
         -- is never silently resolved by a lower-priority heuristic.
         SELECT count(*), count(*) FILTER (
@@ -795,17 +998,15 @@ BEGIN
               AND c.amount_units = signed_units
         ) INTO candidate_count, compatible_count
         FROM pg_temp.reconcile_candidate_cache c
-        WHERE NOT EXISTS (
-            SELECT 1 FROM reconcile_matches m
-            WHERE m.run_id = p_run_id AND m.ledger_entry_id = c.ledger_entry_id
-              AND m.status IN ('EXACT', 'PROBABLE')
-        ) AND (
-            (external_row.external_reference IS NOT NULL AND c.reference = external_row.external_reference)
-            OR c.reference = external_row.external_transaction_id
-            OR c.metadata->>'external_transaction_id' = external_row.external_transaction_id
-            OR (external_row.external_reference IS NOT NULL AND
-                (c.metadata->>'external_reference' = external_row.external_reference
-                 OR c.metadata->>'provider_reference' = external_row.external_reference))
+        WHERE (
+            c.reference = ANY(reference_keys)
+            OR c.metadata->>'external_transaction_id' = ANY(reference_keys)
+            OR c.metadata->>'external_reference' = ANY(reference_keys)
+            OR c.metadata->>'provider_reference' = ANY(reference_keys)
+            OR c.metadata->>'txid' = ANY(reference_keys)
+            OR (c.metadata->>'txid') || ':' || (c.metadata->>'output_index') = ANY(reference_keys)
+            OR c.metadata->>'tx_hash' = ANY(reference_keys)
+            OR (c.metadata->>'tx_hash') || ':' || (c.metadata->>'log_index') = ANY(reference_keys)
         );
 
         IF candidate_count > 0 THEN
@@ -814,18 +1015,39 @@ BEGIN
                 FROM pg_temp.reconcile_candidate_cache c
                 WHERE c.asset_identity = external_row.asset_identity
                   AND c.amount_units = signed_units
-                  AND NOT EXISTS (
-                      SELECT 1 FROM reconcile_matches m
-                      WHERE m.run_id = p_run_id AND m.ledger_entry_id = c.ledger_entry_id
-                        AND m.status IN ('EXACT', 'PROBABLE')
-                  ) AND (
-                    (external_row.external_reference IS NOT NULL AND c.reference = external_row.external_reference)
-                    OR c.reference = external_row.external_transaction_id
-                    OR c.metadata->>'external_transaction_id' = external_row.external_transaction_id
-                    OR (external_row.external_reference IS NOT NULL AND
-                        (c.metadata->>'external_reference' = external_row.external_reference
-                         OR c.metadata->>'provider_reference' = external_row.external_reference))
+                  AND (
+                    c.reference = ANY(reference_keys)
+                    OR c.metadata->>'external_transaction_id' = ANY(reference_keys)
+                    OR c.metadata->>'external_reference' = ANY(reference_keys)
+                    OR c.metadata->>'provider_reference' = ANY(reference_keys)
+                    OR c.metadata->>'txid' = ANY(reference_keys)
+                    OR (c.metadata->>'txid') || ':' || (c.metadata->>'output_index') = ANY(reference_keys)
+                    OR c.metadata->>'tx_hash' = ANY(reference_keys)
+                    OR (c.metadata->>'tx_hash') || ':' || (c.metadata->>'log_index') = ANY(reference_keys)
                   ) LIMIT 1;
+                IF EXISTS (
+                    SELECT 1 FROM reconcile_matches m
+                    WHERE m.run_id = p_run_id
+                      AND m.ledger_entry_id = candidate.ledger_entry_id
+                      AND m.status IN ('EXACT', 'PROBABLE')
+                ) OR EXISTS (
+                    SELECT 1 FROM pg_temp.reconcile_manual_cache reserved
+                    WHERE reserved.decision = 'MATCH'
+                      AND reserved.ledger_entry_id = candidate.ledger_entry_id
+                      AND reserved.external_transaction_id <> external_row.id
+                ) THEN
+                    INSERT INTO reconcile_matches (
+                        run_id, external_transaction_id, ledger_transaction_id,
+                        ledger_entry_id, status, score, reason
+                    ) VALUES (
+                        p_run_id, external_row.id, candidate.ledger_transaction_id,
+                        candidate.ledger_entry_id, 'CONFLICT', 150,
+                        jsonb_build_object('strategy', 'explicit_reference',
+                                           'conflict', 'candidate_already_matched')
+                    );
+                    inserted_count := inserted_count + 1;
+                    CONTINUE;
+                END IF;
                 INSERT INTO reconcile_matches (
                     run_id, external_transaction_id, ledger_transaction_id, ledger_entry_id,
                     status, score, reason
@@ -844,12 +1066,14 @@ BEGIN
                     FROM pg_temp.reconcile_candidate_cache c
                     WHERE c.asset_identity = external_row.asset_identity
                       AND c.amount_units = signed_units
-                      AND ((external_row.external_reference IS NOT NULL AND c.reference = external_row.external_reference)
-                        OR c.reference = external_row.external_transaction_id
-                        OR c.metadata->>'external_transaction_id' = external_row.external_transaction_id
-                        OR (external_row.external_reference IS NOT NULL AND
-                            (c.metadata->>'external_reference' = external_row.external_reference
-                             OR c.metadata->>'provider_reference' = external_row.external_reference)))
+                      AND (c.reference = ANY(reference_keys)
+                        OR c.metadata->>'external_transaction_id' = ANY(reference_keys)
+                        OR c.metadata->>'external_reference' = ANY(reference_keys)
+                        OR c.metadata->>'provider_reference' = ANY(reference_keys)
+                        OR c.metadata->>'txid' = ANY(reference_keys)
+                        OR (c.metadata->>'txid') || ':' || (c.metadata->>'output_index') = ANY(reference_keys)
+                        OR c.metadata->>'tx_hash' = ANY(reference_keys)
+                        OR (c.metadata->>'tx_hash') || ':' || (c.metadata->>'log_index') = ANY(reference_keys))
                 LOOP
                     INSERT INTO reconcile_matches (
                         run_id, external_transaction_id, ledger_transaction_id, ledger_entry_id,
@@ -865,9 +1089,14 @@ BEGIN
             ELSE
                 SELECT c.* INTO candidate
                 FROM pg_temp.reconcile_candidate_cache c
-                WHERE (external_row.external_reference IS NOT NULL AND c.reference = external_row.external_reference)
-                   OR c.reference = external_row.external_transaction_id
-                   OR c.metadata->>'external_transaction_id' = external_row.external_transaction_id
+                WHERE c.reference = ANY(reference_keys)
+                   OR c.metadata->>'external_transaction_id' = ANY(reference_keys)
+                   OR c.metadata->>'external_reference' = ANY(reference_keys)
+                   OR c.metadata->>'provider_reference' = ANY(reference_keys)
+                   OR c.metadata->>'txid' = ANY(reference_keys)
+                   OR (c.metadata->>'txid') || ':' || (c.metadata->>'output_index') = ANY(reference_keys)
+                   OR c.metadata->>'tx_hash' = ANY(reference_keys)
+                   OR (c.metadata->>'tx_hash') || ':' || (c.metadata->>'log_index') = ANY(reference_keys)
                 LIMIT 1;
                 INSERT INTO reconcile_matches (
                     run_id, external_transaction_id, ledger_transaction_id, ledger_entry_id,
@@ -899,6 +1128,12 @@ BEGIN
                   SELECT 1 FROM reconcile_matches m
                   WHERE m.run_id = p_run_id AND m.ledger_entry_id = c.ledger_entry_id
                     AND m.status IN ('EXACT', 'PROBABLE')
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM pg_temp.reconcile_manual_cache reserved
+                  WHERE reserved.decision = 'MATCH'
+                    AND reserved.ledger_entry_id = c.ledger_entry_id
+                    AND reserved.external_transaction_id <> external_row.id
               );
             IF candidate_count = 1 THEN
                 SELECT c.* INTO candidate
@@ -911,6 +1146,12 @@ BEGIN
                       SELECT 1 FROM reconcile_matches m
                       WHERE m.run_id = p_run_id AND m.ledger_entry_id = c.ledger_entry_id
                         AND m.status IN ('EXACT', 'PROBABLE')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM pg_temp.reconcile_manual_cache reserved
+                      WHERE reserved.decision = 'MATCH'
+                        AND reserved.ledger_entry_id = c.ledger_entry_id
+                        AND reserved.external_transaction_id <> external_row.id
                   ) LIMIT 1;
                 INSERT INTO reconcile_matches (
                     run_id, external_transaction_id, ledger_transaction_id, ledger_entry_id,
@@ -934,6 +1175,18 @@ BEGIN
                       AND c.amount_units = signed_units
                       AND abs(extract(epoch FROM (c.event_at - external_row.event_at))) * interval '1 second'
                             <= run_row.matching_time_window
+                      AND NOT EXISTS (
+                          SELECT 1 FROM reconcile_matches m
+                          WHERE m.run_id = p_run_id
+                            AND m.ledger_entry_id = c.ledger_entry_id
+                            AND m.status IN ('EXACT', 'PROBABLE')
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM pg_temp.reconcile_manual_cache reserved
+                          WHERE reserved.decision = 'MATCH'
+                            AND reserved.ledger_entry_id = c.ledger_entry_id
+                            AND reserved.external_transaction_id <> external_row.id
+                      )
                 LOOP
                     INSERT INTO reconcile_matches (
                         run_id, external_transaction_id, ledger_transaction_id, ledger_entry_id,
@@ -988,9 +1241,7 @@ AS $body$
 DECLARE
     new_run uuid;
 BEGIN
-    new_run := _reconcile_start_run(account_id, 'TRANSACTIONS', as_of);
-    PERFORM _reconcile_transactions_into_run(new_run);
-    PERFORM _reconcile_finish_run(new_run);
+    new_run := _reconcile_execute_run_rust(account_id, 'TRANSACTIONS', as_of);
     RETURN QUERY SELECT * FROM reconcile_matches WHERE run_id = new_run ORDER BY created_at, id;
 END
 $body$;
@@ -1012,10 +1263,7 @@ AS $body$
 DECLARE
     new_run uuid;
 BEGIN
-    new_run := _reconcile_start_run(account_id, 'FULL', as_of);
-    PERFORM _reconcile_balance_into_run(new_run);
-    PERFORM _reconcile_transactions_into_run(new_run);
-    PERFORM _reconcile_finish_run(new_run);
+    new_run := _reconcile_execute_run_rust(account_id, 'FULL', as_of);
     RETURN QUERY
     SELECT new_run, b.status,
            count(*) FILTER (WHERE m.status = 'EXACT'),
@@ -1032,13 +1280,15 @@ $body$;
 
 CREATE FUNCTION reconcile_run(run_id uuid)
 RETURNS reconcile_runs
-LANGUAGE sql STABLE PARALLEL SAFE
+LANGUAGE sql STABLE PARALLEL RESTRICTED
+SECURITY DEFINER
 SET search_path = @extschema@, pg_catalog
 AS 'SELECT * FROM reconcile_runs WHERE id = run_id';
 
 CREATE FUNCTION reconcile_results(run_id uuid)
 RETURNS TABLE(result_kind text, result jsonb)
-LANGUAGE sql STABLE PARALLEL SAFE
+LANGUAGE sql STABLE PARALLEL RESTRICTED
+SECURITY DEFINER
 SET search_path = @extschema@, pg_catalog
 AS $body$
     SELECT 'balance', to_jsonb(b) FROM reconcile_balance_results b WHERE b.run_id = $1
@@ -1050,7 +1300,7 @@ CREATE FUNCTION reconcile_match_manual(
     external_transaction uuid,
     ledger_transaction uuid,
     reason text,
-    actor text DEFAULT current_user
+    actor text DEFAULT session_user
 ) RETURNS uuid
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1073,7 +1323,9 @@ BEGIN
                                                 ELSE -external_row.amount_units END;
     SELECT * INTO account_row FROM reconcile_accounts WHERE id = external_row.reconcile_account_id;
     SELECT c.* INTO candidate
-    FROM _reconcile_ledger_candidates(account_row.ledger_account_id, 'infinity'::timestamptz) c
+    FROM _reconcile_ledger_candidates(
+        account_row.ledger_account_id, 'infinity'::timestamptz, clock_timestamp()
+    ) c
     WHERE c.ledger_transaction_id = ledger_transaction
       AND c.asset_identity = external_row.asset_identity
       AND c.amount_units = signed_units
@@ -1083,12 +1335,34 @@ BEGIN
         RAISE EXCEPTION 'manual match ledger transaction is absent or has incompatible asset/amount'
             USING ERRCODE = 'PGR08', DETAIL = 'RECONCILE_INVALID_MANUAL_MATCH';
     END IF;
+    IF actor IS DISTINCT FROM session_user::text THEN
+        RAISE EXCEPTION 'manual decision actor must be the authenticated database session user'
+            USING ERRCODE = 'PGR08', DETAIL = 'RECONCILE_INVALID_MANUAL_MATCH';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(
+        'pg_reconcile:manual:ledger-entry:' || candidate.ledger_entry_id::text, 0
+    ));
+    IF EXISTS (
+        SELECT 1
+        FROM (
+            SELECT DISTINCT ON (d.external_transaction_id)
+                   d.external_transaction_id, d.ledger_entry_id, d.decision
+            FROM reconcile_manual_decisions d
+            ORDER BY d.external_transaction_id, d.created_at DESC, d.id DESC
+        ) active
+        WHERE active.decision = 'MATCH'
+          AND active.ledger_entry_id = candidate.ledger_entry_id
+          AND active.external_transaction_id <> external_transaction
+    ) THEN
+        RAISE EXCEPTION 'ledger entry already has an active manual mapping'
+            USING ERRCODE = 'PGR08', DETAIL = 'RECONCILE_INVALID_MANUAL_MATCH';
+    END IF;
     INSERT INTO reconcile_manual_decisions (
         external_transaction_id, ledger_transaction_id, ledger_entry_id,
         decision, reason, actor
     ) VALUES (
         external_transaction, ledger_transaction, candidate.ledger_entry_id,
-        'MATCH', reason, actor
+        'MATCH', reason, session_user::text
     ) RETURNING id INTO result;
     RETURN result;
 END
@@ -1097,7 +1371,7 @@ $body$;
 CREATE FUNCTION reconcile_mark_external_unmatched(
     external_transaction uuid,
     reason text,
-    actor text DEFAULT current_user
+    actor text DEFAULT session_user
 ) RETURNS uuid
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -1111,10 +1385,14 @@ BEGIN
         RAISE EXCEPTION 'external transaction % does not exist', external_transaction
             USING ERRCODE = 'PGR01', DETAIL = 'RECONCILE_ACCOUNT_NOT_FOUND';
     END IF;
+    IF actor IS DISTINCT FROM session_user::text THEN
+        RAISE EXCEPTION 'manual decision actor must be the authenticated database session user'
+            USING ERRCODE = 'PGR08', DETAIL = 'RECONCILE_INVALID_MANUAL_MATCH';
+    END IF;
     INSERT INTO reconcile_manual_decisions (
         external_transaction_id, decision, reason, actor
     ) VALUES (
-        external_transaction, 'MARK_UNMATCHED_EXTERNAL', reason, actor
+        external_transaction, 'MARK_UNMATCHED_EXTERNAL', reason, session_user::text
     ) RETURNING id INTO result;
     RETURN result;
 END
@@ -1167,5 +1445,6 @@ $body$;
 CREATE FUNCTION reconcile_validate()
 RETURNS TABLE(check_name text, status text, violations bigint)
 LANGUAGE sql STABLE PARALLEL RESTRICTED
+SECURITY DEFINER
 SET search_path = @extschema@, pg_catalog
 AS 'SELECT * FROM _reconcile_validate_rust()';

@@ -21,6 +21,21 @@ jobs:
         with:
           repository: RustedBytes/pg-ledger
           path: dependencies/pg-ledger
+      - uses: actions/checkout@v4
+        if: matrix.pg == 18
+        with:
+          repository: RustedBytes/pg-money
+          path: dependencies/pg-money
+      - uses: actions/checkout@v4
+        if: matrix.pg == 18
+        with:
+          repository: RustedBytes/pg-cryptocurrency
+          path: dependencies/pg-cryptocurrency
+      - uses: actions/checkout@v4
+        if: matrix.pg == 18
+        with:
+          repository: RustedBytes/pg-fx
+          path: dependencies/pg-fx
 
       - name: Install Rust and build prerequisites
         run: |
@@ -59,12 +74,31 @@ jobs:
             --pg-config "$(cargo pgrx info pg-config '${{ matrix.pg }}')" \
             --no-default-features --features "pg${{ matrix.pg }}"
 
+      - name: Install full-stack companion extensions
+        if: matrix.pg == 18
+        run: |
+          cd dependencies/pg-money
+          cargo pgrx install --pg-config "$(cargo pgrx info pg-config 18)" \
+            --no-default-features --features pg18
+          cd ../pg-cryptocurrency
+          cargo pgrx install --pg-config "$(cargo pgrx info pg-config 18)" \
+            --no-default-features --features pg18
+          cd ../pg-fx
+          cargo pgrx install --pg-config "$(cargo pgrx info pg-config 18)" \
+            --no-default-features --features pg18
+
       - name: Check formatting and lints
         if: matrix.pg == 18
         run: |
           cargo fmt --all -- --check
           cargo clippy --all-targets --no-default-features \
             --features pg18 -- -D warnings -W clippy::pedantic
+
+      - name: Test standalone Rust and pgrx harnesses
+        if: matrix.pg == 18
+        run: |
+          cargo test --no-default-features --features pg18 --lib
+          cargo pgrx test pg18 --no-default-features --features pg18
 
       - name: Validate upgrade metadata
         if: matrix.pg == 18
@@ -75,6 +109,10 @@ jobs:
 
       - name: Test optional extension installation order
         run: ./ci/test-interoperability.sh "$(cargo pgrx info pg-config '${{ matrix.pg }}')"
+
+      - name: Test complete RustedBytes stack
+        if: matrix.pg == 18
+        run: ./ci/test-full-stack.sh "$(cargo pgrx info pg-config 18)"
 
       - name: Verify package contents
         run: |
