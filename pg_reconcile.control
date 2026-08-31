@@ -1,0 +1,5 @@
+comment = 'Exact, append-only reconciliation for PostgreSQL ledgers'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_reconcile'
+relocatable = false
+superuser = false

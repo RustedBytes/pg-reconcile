@@ -1,0 +1,20 @@
+threads = 0
+exclude_paths = ["target", ".git", "node_modules"]
+min_severity = "info"
+precision = "conservative"
+
+[thresholds.arch]
+god_module_loc = 1200
+god_module_items = 30
+
+[thresholds.impl]
+long_function_loc = 60
+cyclomatic_complexity = 15
+too_many_arguments = 8
+
+[policy]
+skip_tests = true
+skip_examples = true
+skip_benches = true
+skip_generated = true
+skip_macro_heavy_files = true

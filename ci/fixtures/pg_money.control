@@ -1,0 +1,4 @@
+comment = 'pg_money interoperability fixture'
+default_version = '0.0.1'
+relocatable = true
+superuser = false
